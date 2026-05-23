@@ -14,9 +14,19 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-- name: Create nodes to test this role locally outside CI
-  ansible.builtin.include_tasks: non_zuul.yml
-  tags: [never, local]
+- name: Run tasks/controller-pre.yml
+  ansible.builtin.include_tasks: controller-pre.yml
 
 - name: Tasks to run inside Zuul CI
-  ansible.builtin.include_tasks: in_zuul.yml
+  environment:
+    ANSIBLE_LOG_PATH: "{{ ansible_user_dir }}/in_zuul_ansible.log"
+  ansible.builtin.command:
+    chdir: "{{ ansible_user_dir }}/src/github.com/openstack-k8s-operators/ci-bootstrap"
+    cmd: >-
+      {{ cifmw_bootstrap_venv_dir }}/bin/ansible-playbook in_zuul-playbook.yml
+      --connection local
+      --inventory localhost,
+      --extra-vars @/etc/ci/env/in_zuul-vars.yml
+
+- name: Run tasks/controller-post.yml
+  ansible.builtin.include_tasks: controller-post.yml

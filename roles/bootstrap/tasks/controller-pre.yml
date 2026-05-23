@@ -1,0 +1,153 @@
+---
+# Copyright Red Hat, Inc.
+# All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License"); you may
+# not use this file except in compliance with the License. You may obtain
+# a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+# License for the specific language governing permissions and limitations
+# under the License.
+
+- name: Ensure CI directory
+  become: true
+  ansible.builtin.file:
+    path: "{{ cifmw_bootstrap_ci_infra_dir }}"
+    state: directory
+    mode: '0755'
+
+- name: Create openstack config dir
+  ansible.builtin.file:
+    path: "{{ cifmw_bootstrap_openstack_config_dir }}"
+    state: directory
+    mode: '0755'
+  tags: always
+
+- name: Generate cert and load related vars
+  when:
+    - cloud_secrets[ cifmw_bootstrap_cloud_name ].ca_cert is defined
+    - cloud_secrets[ cifmw_bootstrap_cloud_name ].ca_cert_path is defined
+  become: true
+  block:
+    - name: Generate CA cert file
+      ansible.builtin.copy:
+        content: "{{ cloud_secrets[ cifmw_bootstrap_cloud_name ].ca_cert }}"
+        dest: "{{ cloud_secrets[ cifmw_bootstrap_cloud_name ].ca_cert_path }}"
+        mode: 0755
+
+    - name: Update CA certs
+      ansible.builtin.command: update-ca-trust
+
+- name: Write clouds.yaml file
+  ansible.builtin.template:
+    src: clouds.yaml.j2
+    dest: "{{ cifmw_bootstrap_clouds_yaml }}"
+    mode: "0600"
+  tags: always
+
+- name: Simulate clone repos in the job workspace - prepare-workspace (local)
+  when: "'local' in ansible_run_tags or 'inject' in ansible_run_tags"
+  block:
+    - name: Create directory
+      ansible.builtin.file:
+        path: "{{ ansible_user_dir }}/src/github.com/openstack-k8s-operators/ci-bootstrap/"
+        state: directory
+        mode: '0755'
+    - name: Copy the ci-bootstrap repo
+      ansible.posix.synchronize:
+        src: "{{ role_path }}/../../"
+        dest: "{{ ansible_user_dir }}/src/github.com/openstack-k8s-operators/ci-bootstrap/"
+
+- name: Clone repos in the job workspace
+  when:
+    - "'local' not in ansible_run_tags"
+    - "'inject' not in ansible_run_tags"
+  ansible.builtin.include_role:
+    name: prepare-workspace
+
+- name: Install packages
+  become: true
+  ansible.builtin.package:
+    name:
+      - python3-pip
+    state: present
+
+# NOTE(hjensas): There is an issue with collection module not using the virtualenv,
+# so we need to install openstacksdk in the user local.
+- name: Install openstacksdk (outside virtualenv)
+  when: "'local' in ansible_run_tags or 'inject' in ansible_run_tags"
+  ansible.builtin.pip:
+    name:
+      - "openstacksdk"
+
+- name: Install ansible in virtualenv
+  ansible.builtin.pip:
+    virtualenv_command: "python3 -m venv"
+    virtualenv: "{{ cifmw_bootstrap_venv_dir }}"
+    name:
+      - "python-openstackclient"
+      - "openstacksdk"
+      - "ansible-core"
+
+- name: Ensure Ansible galaxy collections are installed
+  ansible.builtin.command:
+    cmd: >-
+      {{ cifmw_bootstrap_venv_dir }}/bin/ansible-galaxy collection install {{ item }}
+  loop:
+    - openstack.cloud
+
+- name: Copy in_zuul playbooks
+  ansible.builtin.copy:
+    src: "{{ item }}"
+    dest: "{{ ansible_user_dir }}/src/github.com/openstack-k8s-operators/ci-bootstrap/{{ item }}"
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: 0655
+  loop:
+    - in_zuul_cleanup-playbook.yaml
+    - in_zuul-playbook.yml
+
+- name: Set fact nodepool_instance_id_map
+  ansible.builtin.set_fact:
+    nodepool_instance_id_map: >-
+      {{
+        nodepool_instance_id_map | default({}) | combine(
+          {
+            host_item.key: hostvars[host_item.key]['nodepool']['external_id']
+          }
+        )
+      }}
+  loop: "{{ hostvars | dict2items }}"
+  loop_control:
+    label: "{{ host_item.key }}"
+    loop_var: host_item
+
+- name: Write vars file for nested execution
+  vars:
+    content:
+      cifmw_bootstrap_net_env_def_path: "{{ cifmw_bootstrap_net_env_def_path }}"
+      cifmw_bootstrap_ci_infra_dir: "{{ cifmw_bootstrap_ci_infra_dir }}"
+      zuul: "{{ zuul }}"
+      cifmw_bootstrap_venv_dir: "{{ cifmw_bootstrap_venv_dir }}"
+      nodepool_instance_id_map: "{{ nodepool_instance_id_map }}"
+      cifmw_bootstrap_cloud_name: "{{ cifmw_bootstrap_cloud_name }}"
+      cifmw_bootstrap_net_name_prefix: "{{ cifmw_bootstrap_net_name_prefix }}"
+      cifmw_bootstrap_create_application_credential: "{{ cifmw_bootstrap_create_application_credential }}"
+  become: true
+  ansible.builtin.copy:
+    dest: /etc/ci/env/in_zuul-vars.yml
+    content: "{{ content | to_nice_yaml }}"
+    owner: root
+    group: root
+    mode: '0644'
+
+# NOTE(hjensas): Set this fact here so that task in playbooks consuming
+# the role can use this var after running these tasks.
+- name: Set cifmw_bootstrap_venv_dir fact
+  ansible.builtin.set_fact:
+    cifmw_bootstrap_venv_dir: "{{ cifmw_bootstrap_venv_dir }}"
